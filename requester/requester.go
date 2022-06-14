@@ -17,6 +17,7 @@ package requester
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"io"
 	"io/ioutil"
@@ -27,6 +28,10 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	ott "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 )
 
@@ -117,7 +122,7 @@ func (b *Work) Init() {
 
 // Run makes all the requests, prints the summary. It blocks until
 // all work is done.
-func (b *Work) Run() {
+func (b *Work) Run(ctx context.Context) {
 	b.Init()
 	b.start = now()
 	b.report = newReport(b.writer(), b.results, b.Output, b.N)
@@ -125,7 +130,7 @@ func (b *Work) Run() {
 	go func() {
 		runReporter(b.report)
 	}()
-	b.runWorkers()
+	b.runWorkers(ctx)
 	b.Finish()
 }
 
@@ -144,7 +149,7 @@ func (b *Work) Finish() {
 	b.report.finalize(total)
 }
 
-func (b *Work) makeRequest(c *http.Client) {
+func (b *Work) makeRequest(ctx context.Context, c *http.Client) {
 	s := now()
 	var size int64
 	var code int
@@ -156,6 +161,8 @@ func (b *Work) makeRequest(c *http.Client) {
 	} else {
 		req = cloneRequest(b.Request, b.RequestBody)
 	}
+	ctx, sp := otel.Tracer("requester.go").Start(ctx, "Work.makeRequest")
+	defer sp.End()
 	trace := &httptrace.ClientTrace{
 		DNSStart: func(info httptrace.DNSStartInfo) {
 			dnsStart = now()
@@ -181,7 +188,7 @@ func (b *Work) makeRequest(c *http.Client) {
 			resStart = now()
 		},
 	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
 	resp, err := c.Do(req)
 	if err == nil {
 		size = resp.ContentLength
@@ -206,7 +213,9 @@ func (b *Work) makeRequest(c *http.Client) {
 	}
 }
 
-func (b *Work) runWorker(client *http.Client, n int) {
+func (b *Work) runWorker(ctx context.Context, client *http.Client, n int) {
+	ctx, sp := otel.Tracer("requester.go").Start(ctx, "Work.runWorker", ott.WithAttributes(attribute.Int("n", n)))
+	defer sp.End()
 	var throttle <-chan time.Time
 	if b.QPS > 0 {
 		throttle = time.Tick(time.Duration(1e6/(b.QPS)) * time.Microsecond)
@@ -226,12 +235,12 @@ func (b *Work) runWorker(client *http.Client, n int) {
 			if b.QPS > 0 {
 				<-throttle
 			}
-			b.makeRequest(client)
+			b.makeRequest(ctx, client)
 		}
 	}
 }
 
-func (b *Work) runWorkers() {
+func (b *Work) runWorkers(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(b.C)
 
@@ -250,12 +259,13 @@ func (b *Work) runWorkers() {
 	} else {
 		tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	}
-	client := &http.Client{Transport: tr, Timeout: time.Duration(b.Timeout) * time.Second}
+
+	client := &http.Client{Transport: otelhttp.NewTransport(tr), Timeout: time.Duration(b.Timeout) * time.Second}
 
 	// Ignore the case where b.N % b.C != 0.
 	for i := 0; i < b.C; i++ {
 		go func() {
-			b.runWorker(client, b.N/b.C)
+			b.runWorker(ctx, client, b.N/b.C)
 			wg.Done()
 		}()
 	}

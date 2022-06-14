@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -29,7 +30,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gopuff/morecontext"
 	"github.com/rakyll/hey/requester"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
+	otrace "go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -48,6 +57,9 @@ var (
 	authHeader  = flag.String("a", "", "")
 	hostHeader  = flag.String("host", "", "")
 	userAgent   = flag.String("U", "", "")
+
+	otelEndpoint = flag.String("otel-grpc-endpoint", "", "")
+	otelName     = flag.String("otel-name", "hey", "")
 
 	output = flag.String("o", "", "")
 
@@ -101,6 +113,10 @@ Options:
   -disable-redirects    Disable following of HTTP redirects
   -cpus                 Number of used cpu cores.
                         (default for current machine is %d cores)
+
+
+  -otel-grpc-endpoint   Enables otel tracing and sends traces to the given endpoint
+	-otel-name						Sets the otel service name [default "hey"]
 `
 
 func main() {
@@ -135,6 +151,46 @@ func main() {
 		if num < conc {
 			usageAndExit("-n cannot be less than -c.")
 		}
+	}
+
+	ctx := morecontext.ForSignals()
+	if otelEndpoint != nil && *otelEndpoint != "" {
+		trc, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(*otelEndpoint), otlptracegrpc.WithInsecure())
+		if err != nil {
+			errAndExit("error creating otel tracer: " + err.Error())
+		}
+		res, err := resource.Merge(
+			resource.Default(),
+			resource.NewWithAttributes(
+				semconv.SchemaURL,
+				semconv.ServiceNameKey.String(*otelName),
+			),
+		)
+		if err != nil {
+			errAndExit("error creating otel resource: " + err.Error())
+		}
+		tp := trace.NewTracerProvider(
+			trace.WithResource(res),
+			trace.WithBatcher(trc),
+		)
+		trc.Start(ctx)
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := tp.ForceFlush(ctx)
+			if err != nil {
+				errAndExit("error flushing otel: " + err.Error())
+			}
+			trc.Shutdown(ctx)
+		}()
+
+		otel.SetTracerProvider(tp)
+		otel.SetTextMapPropagator(propagation.TraceContext{})
+
+		var sp otrace.Span
+		ctx, sp = otel.Tracer("hey.go").Start(ctx, "main")
+		defer sp.End()
 	}
 
 	url := flag.Args()[0]
@@ -249,7 +305,7 @@ func main() {
 			w.Stop()
 		}()
 	}
-	w.Run()
+	w.Run(ctx)
 }
 
 func errAndExit(msg string) {
